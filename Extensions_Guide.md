@@ -33,7 +33,15 @@ There isn't a traditional "plugin" system where you drop a package into an exten
     *   [Specialized Logging and Debugging](#5-specialized-logging-and-debugging-debugmode-telemetry-settings)
     *   [Checkpointing Strategy](#6-checkpointing-strategy-checkpointing)
     *   [Guiding File Discovery for Context](#7-guiding-file-discovery-for-context-filefiltering)
-5.  [Advanced Extension Example: Intercepting API Calls for Debugging](#advanced-extension-example-intercepting-api-calls-for-debugging)
+5.  [Advanced Customization: Beyond Standard Extensions](#advanced-customization-beyond-standard-extensions)
+    *   [Use Case: High-Fidelity API Request Preview for Debugging](#use-case-high-fidelity-api-request-preview-for-debugging)
+    *   [The External Tool Idea (and its Limitations for This Specific Goal)](#the-external-tool-idea-and-its-limitations-for-this-specific-goal)
+    *   [The Correct Approach for Deep Introspection: Modifying Core CLI Logic](#the-correct-approach-for-deep-introspection-modifying-core-cli-logic)
+        *   [Hierarchy of Solutions](#hierarchy-of-solutions)
+        *   [User Goal Revisited: API Call Preview](#user-goal-revisited-api-call-preview)
+        *   [Conceptual Implementation within Core Logic](#conceptual-implementation-within-core-logic)
+        *   [Development Steps (Guidance for a User/LLM Assistant)](#development-steps-guidance-for-a-userllm-assistant)
+        *   [Conclusion on Source Code Modification](#conclusion-on-source-code-modification)
 6.  [Brainstorming New Extensions: List of Possible Capabilities](#brainstorming-new-extensions-list-of-possible-capabilities)
     *   [I. Adding Custom Tools & Actions](#i-adding-custom-tools--actions)
     *   [II. Enhancing LLM Knowledge & Behavior](#ii-enhancing-llm-knowledge--behavior)
@@ -458,116 +466,136 @@ While custom tools and custom context are the primary ways to extend the CLI's f
 
 By thinking about these configuration points, an LLM designing an extension can provide a more holistic solution that not only adds tools and knowledge but also guides the user in setting up the CLI environment for optimal interaction with the extension.
 
-## Advanced Extension Example: Intercepting API Calls for Debugging
+## Advanced Customization: Beyond Standard Extensions
 
-One powerful use case for extensions is to create tools that help debug or understand the CLI's interactions with the Large Language Model (LLM). Imagine a scenario where a user wants to see the exact, fully assembled prompt, including all context and tool definitions, that is about to be sent to the LLM, *without actually sending it* and incurring API costs or waiting for a response. This can be invaluable for debugging why an LLM might be behaving unexpectedly or for learning how context is being constructed.
+This section discusses scenarios where the standard extension mechanisms (custom tools via external commands/MCP, context files) might not be sufficient to achieve a desired level of introspection or behavioral modification. It uses the example of creating a high-fidelity API request preview to illustrate when and how one might consider direct modification of the CLI's source code.
 
-This example outlines how such an "API Call Preview" extension could be built.
+### Use Case: High-Fidelity API Request Preview for Debugging
 
-**Goal of the Extension:**
+A common desire for advanced users and developers is to inspect the exact data package—fully assembled prompt, chat history, system messages, user memory, and tool definitions—that the CLI prepares to send to the Large Language Model (LLM). This "API Call Preview" is invaluable for debugging context issues or understanding precisely what the LLM is working with, *without actually sending the request* and incurring API costs or waiting for a response.
 
-*   To provide a way for the user to type a prompt as they normally would.
-*   Instead of the CLI immediately sending this to the LLM, the extension intercepts this.
-*   The extension then displays the complete data package (prompt, history, tool schemas, etc.) that *would have been* sent to the LLM.
-*   This allows the user to inspect the context, verify tool definitions, and understand exactly what the LLM would receive.
+### The External Tool Idea (and its Limitations for This Specific Goal)
 
-**Components of the Extension:**
+One might initially envision creating a custom tool, say `/preview_llm_request`, as an external command:
+*   It would take the user's intended prompt as input.
+*   Its call handler script would *attempt* to reconstruct what the CLI would send to the LLM.
+*   It would then print this reconstructed payload.
 
-1.  **Custom Tool: `preview_llm_request`**
-    *   **Discovery Script:** The extension's `discover_tools.sh` (or equivalent) would define this tool.
-        ```json
-        // In discover_tools.sh output
-        [
-          {
-            "name": "preview_llm_request",
-            "description": "Captures your input and displays the full request data (prompt, history, tools) that would be sent to the LLM, without actually making the API call. Use this to debug context or understand the API request structure.",
-            "parameters": {
-              "type": "OBJECT",
-              "properties": {
-                "user_prompt": {
-                  "type": "STRING",
-                  "description": "The prompt or question you would normally ask the LLM."
-                }
-              },
-              "required": ["user_prompt"]
-            }
-          }
-        ]
-        ```
-    *   **Call Handler Script (`handle_tool_call.sh preview_llm_request`):** This is the core of the extension. It would need to:
-        *   Receive the `user_prompt` from its `stdin`.
-        *   **Access Core CLI Configuration and State (Conceptual):** This is the trickiest part and highlights where such an extension pushes the boundaries of simple external scripts. The script would ideally need access to:
-            *   The current chat history.
-            *   The fully resolved system prompt.
-            *   The list of all `FunctionDeclaration`s for all currently active tools (built-in and custom).
-            *   The current `Config` object to understand settings like `model`, `userMemory`, etc.
-        *   **Simulate Request Assembly:** The script would then try to replicate the logic that `GeminiClient` or `GeminiChat` uses to assemble the final request payload for the `generateContent` API call. This involves:
-            *   Formatting chat history.
-            *   Combining system prompt, user memory (from context files), and the current `user_prompt`.
-            *   Compiling the list of tool schemas.
-        *   **Output:** Instead of sending this payload to an LLM, the script would pretty-print the assembled JSON (or a summary of it) to `stdout`.
+**Why this External Tool Approach is Flawed for High-Fidelity API Preview:**
 
-2.  **Context File (Optional but Recommended):**
-    *   The extension could include a `preview_extension_guide.md` file.
-    *   This file would be added to `extensionContextFilePaths` in the user's CLI configuration.
-    *   **Content:** "When you want to debug the LLM request, use the `preview_llm_request` tool. Provide your intended prompt to its `user_prompt` parameter. This will show you the data before it goes to the API."
+While the external command tool mechanism is powerful for many extensions, it runs into fundamental limitations when trying to perfectly replicate the live internal state of the CLI for a debugging purpose like API call previewing:
 
-**How the User Would Interact:**
+1.  **Access to Dynamic Internal State:** The primary challenge is that an external script operates in a separate process. It cannot directly and reliably access the live, in-memory state of the main CLI application. This critical state includes:
+    *   **Full Chat History:** The ongoing conversation maintained by the CLI.
+    *   **Resolved Prompts & Context:** The exact system prompt and user memory as assembled by the CLI, which might involve complex loading logic and dynamic elements.
+    *   **Complete Tool Registry:** The live list of all active tools, including those discovered dynamically via MCP or other commands during the session.
+    *   **Session-Specific Configurations:** Any settings that might have changed during the current CLI session (e.g., a model switch due to Flash fallback).
 
-1.  **Configuration:**
-    *   User configures `toolDiscoveryCommand` and `toolCallCommand` to point to the extension's scripts.
-    *   User adds `my-preview-extension/preview_extension_guide.md` to `extensionContextFilePaths`.
+2.  **Difficulty in Perfect Replication:** To show what the CLI *would* send, the external script would need to re-implement a significant amount of the CLI's core logic for prompt assembly, history management, and tool schema compilation. This is not only complex but also creates a fragile extension that could easily break or become inaccurate as the CLI's internal logic evolves.
 
-2.  **Usage:**
-    Instead of directly prompting the LLM like:
-    `$ gemini-cli "Why is the sky blue?"`
+3.  **Risk of Discrepancies:** Because of these challenges, an external tool can, at best, offer an *approximation* of the API request. For true debugging, this approximation might be misleading if it misses crucial pieces of context or uses a slightly different assembly logic. The preview wouldn't be a faithful representation of what the LLM *actually* sees.
 
-    The user would invoke the custom tool:
-    `$ gemini-cli "/preview_llm_request user_prompt='Why is the sky blue?'"`
+4.  **Altered Workflow vs. True Interception:** The custom tool approach (e.g., user typing `/preview_llm_request "my real prompt"`) changes how the user interacts. It doesn't transparently show what *would have happened* with a normal prompt; instead, the user is explicitly invoking a separate utility.
 
-    Or, if the CLI supports interactive tool calls:
-    `/preview_llm_request`
-    Then, when prompted for `user_prompt`: `Why is the sky blue?`
+**Conclusion on the External Tool for API Preview:**
 
-3.  **Output:**
-    The CLI would output something like:
-    ```
-    API Request Preview:
-    --------------------
-    Model: gemini-pro
-    System Prompt: "You are a helpful assistant..."
-    User Memory (from GEMINI.md, etc.): "Context from file1..."
-    Chat History: [
-      {"role": "user", "parts": [{"text": "Hello"}]},
-      {"role": "model", "parts": [{"text": "Hi there!"}]}
-    ]
-    Current User Prompt: "Why is the sky blue?"
-    Tools Available: [
-      {"name": "read_file", "description": "..."},
-      {"name": "replace", "description": "..."}
-      // ... all other tools
-    ]
-    --------------------
-    (Note: This is a simplified representation. The actual output might be a more detailed JSON.)
+For simple "what-if" scenarios or basic prompt templating, an external tool might offer some value. However, for the goal of obtaining a **high-fidelity, accurate preview of the exact data payload the live CLI session would send to the LLM**, the external tool approach is generally insufficient and flawed due to its isolation from the CLI's internal runtime state.
+
+This leads to the understanding that certain advanced introspection or behavioral modification goals, like this precise API call preview, are better addressed by extending or modifying the CLI's core logic directly.
+
+### The Correct Approach for Deep Introspection: Modifying Core CLI Logic
+
+When the goal is to achieve high-fidelity introspection into the CLI's operations or to fundamentally alter core behaviors in ways not supported by existing configurations or standard extension mechanisms, modifying the CLI's source code becomes the most robust and accurate approach.
+
+#### Hierarchy of Solutions
+
+This path should generally be considered after exploring other avenues:
+
+1.  **Leverage Existing CLI Configurations:** Always check if the desired behavior or information can be achieved through existing settings in the CLI's configuration files. The CLI is designed to be quite flexible.
+2.  **Utilize Standard Extension Mechanisms:** For adding new capabilities (tools) or providing additional context, use the External Command tool system, MCP servers, or context files (`extensionContextFilePaths`, `GEMINI.md`) as described earlier in this guide. These methods are designed for extending functionality without altering core code.
+3.  **Consider Source Code Modification (for Advanced Needs):** If the above methods are insufficient—as in our API Call Preview example where precise internal state is needed—then direct modification of the CLI's source code is the next level of customization.
+
+#### User Goal Revisited: API Call Preview
+To see the full, accurate API request data (prompt, history, tools, etc.) that the CLI would send to the LLM, without actually sending it, for debugging purposes.
+
+#### Conceptual Implementation within Core Logic
+
+The most effective way to implement this is to add a conditional check within the CLI's code, right before the point where it makes the actual call to the LLM API (e.g., the `generateContent` method).
+
+*   **Trigger:** This feature would be triggered by a new configuration flag (e.g., `debugOptions.previewApiCall: true` and perhaps `debugOptions.previewApiCallFormat: "json" | "summary"`).
+*   **Logic (Conceptual Snippet):**
+    ```typescript
+    // Conceptual point in the CLI's code (e.g., within GeminiClient or similar)
+    async function makeApiCall(requestPayload: GenerateContentRequest) { // Assuming GenerateContentRequest type
+      const debugOptions = this.config.getDebugOptions(); // Hypothetical getter for new debug options
+
+      if (debugOptions?.isPreviewApiCallEnabled()) {
+        console.log("\n--- API Call Preview ---");
+        if (debugOptions.getPreviewApiCallFormat() === "json") {
+          console.log(JSON.stringify(requestPayload, null, 2));
+        } else {
+          // Implement printSummarizedRequest(requestPayload) for a human-readable summary
+          // This summary would extract key parts: system prompt, recent history, current prompt, tool names.
+          console.log("Model:", requestPayload.model);
+          // ... more summarized fields
+        }
+
+        // Option A: Halt execution for this turn (don't send to LLM)
+        // This would typically involve returning a special response that the CLI understands as "preview only"
+        return {
+          previewDisplayed: true,
+          candidates: [{ content: { parts: [{text: "[API Call Previewed - Not Sent]"}] } }]
+        };
+
+        // Option B: Prompt user if they want to proceed with sending (more complex for CLI flow)
+        // const proceed = await this.cliEnvironment.promptUser("Send this request to the LLM? (y/N)");
+        // if (!proceed) return { previewDisplayed: true, ... };
+      }
+
+      // Original logic: Send requestPayload to the LLM API
+      // return await this.actualLlmApiService.generateContent(requestPayload);
+    }
     ```
 
-**Challenges and Considerations:**
+#### Development Steps (Guidance for a User/LLM Assistant)
 
-*   **Accessing Internal State:** The main challenge for an *external script* is getting access to the CLI's internal state (chat history, resolved prompts, tool registry from `GeminiClient` or `Config`).
-    *   **Simplification:** A simpler version might only show the user's input and what it *thinks* the static parts of the prompt would be, without full history or dynamically loaded tools.
-    *   **Advanced (Hypothetical):** A more deeply integrated extension system (beyond current capabilities) might provide specific APIs for extensions to query this internal state safely.
-    *   **Workaround:** The `handle_tool_call.sh` script *could* try to re-initialize parts of the `Config` and `ToolRegistry` itself by reading the same configuration files the main CLI uses. This is complex and prone to discrepancies if the CLI's internal logic changes. It might also need to manage its own temporary chat history file if it wants to simulate multi-turn conversations for the preview.
+If a user (with development skills) decides this feature is essential, here's a general path an LLM could guide them through:
 
-*   **Maintaining Fidelity:** Accurately replicating the exact request assembly logic of the core CLI can be difficult and brittle.
+1.  **(Optional) Provisional Local Testing with Monkeypatching (Advanced & Risky):**
+    *   **Disclaimer:** This is for highly technical users for temporary, local experimentation only. It's not a robust solution, can easily break, and should not be used for shared or production-like environments.
+    *   **Concept:** If the CLI is a Node.js application and the relevant API call function is accessible, one *might* temporarily override (monkeypatch) that function in their local, modified runtime environment to inject the preview logic.
+    *   **Limitations:** Highly dependent on CLI's internal structure, module system, and susceptibility to such patching. It's a "quick hack" for exploration, not a proper solution.
 
-**Why This Example is Instructive:**
+2.  **Cloning the CLI Repository:**
+    *   The standard and recommended approach for making lasting changes.
+    *   Guide: `git clone <repository_url>` (The URL of the Gemini CLI project)
 
-*   It shows how a custom tool can fundamentally alter the user's interaction flow for a specific purpose (debugging).
-*   It highlights the desire for introspection into the CLI's operations.
-*   It demonstrates a complex requirement that pushes the limits of a purely external command-based extension system, hinting at where more direct integration points or APIs for extensions could be beneficial in the future for such advanced scenarios.
-*   Even a simplified version that, for instance, just shows the `user_prompt` combined with `userMemory` (loaded by the script itself by mimicking `loadServerHierarchicalMemory`) and the list of tools from its own discovery could be useful.
+3.  **Identifying the Code Location for API Calls:**
+    *   Guide the user to search the codebase for where `generateContent` (or the specific LLM SDK call) is made. This might be in a file like `packages/core/src/core/client.ts` (class `GeminiClient`) or within the `Turn.ts` class logic that orchestrates the call. Look for methods that prepare and send requests to the GenAI SDK.
 
-This "API Call Preview" extension, even with potential simplifications, serves as a powerful example of how users might want to extend the CLI for deeper understanding and control over LLM interactions.
+4.  **Implementing the Feature:**
+    *   Guide on adding the new configuration flags (e.g., `previewApiCallEnabled`, `previewApiCallFormat`) to `ConfigParameters` and `Config` (likely in `packages/core/src/config/config.ts`). This includes defining how these options are accessed (e.g., `this.config.getDebugPreviewApiCallEnabled()`).
+    *   Show how to add the conditional logic (as per the conceptual example above) in the identified API call location.
+    *   If a summarized format is desired, the `printSummarizedRequest` function would need to be implemented.
+
+5.  **Building and Testing Locally:**
+    *   Provide instructions or point to project documentation on how to build the CLI from source (e.g., `npm install && npm run build` in the root and potentially `packages/cli`).
+    *   Explain how to run the locally built version to test the new feature (e.g., by linking the `packages/cli/bin/gemini.js` or using `npm link`).
+
+6.  **Creating a Pull Request (If Contributing Back):**
+    *   If the user wants to contribute this feature to the main project:
+        *   Create a fork of the repository.
+        *   Create a new branch for the feature (e.g., `feat/api-preview-debug`).
+        *   Commit changes following project conventions (e.g., conventional commit messages: `feat(debug): add API call preview mode`).
+        *   Write unit tests for the new feature and configuration.
+        *   Update any relevant documentation (e.g., a new section in a `DEBUGGING.md` or user guide, and updating `AGENTS.md` if applicable).
+        *   Push the branch to their fork and open a Pull Request to the main repository, clearly describing the feature, its motivation, and how it works.
+
+#### Conclusion on Source Code Modification
+
+Modifying the CLI's source code is the most powerful way to add features that require deep integration or access to internal state. It offers the highest fidelity for features like the API Call Preview. However, it also requires development skills (TypeScript/Node.js for this project), familiarity with the codebase, and the effort of maintaining a custom version or contributing changes upstream.
+
+This approach represents a higher level of customization, generally pursued when existing configuration and standard extension mechanisms cannot meet specific, advanced requirements.
 
 ## Brainstorming New Extensions: List of Possible Capabilities
 

@@ -41,6 +41,7 @@ There isn't a traditional "plugin" system where you drop a package into an exten
         *   [User Goal Revisited: API Call Preview](#user-goal-revisited-api-call-preview)
         *   [Conceptual Implementation within Core Logic](#conceptual-implementation-within-core-logic)
         *   [Development Steps (Guidance for a User/LLM Assistant)](#development-steps-guidance-for-a-userllm-assistant)
+        *   [Code Examples for Local Implementation](#code-examples-for-local-implementation)
         *   [Conclusion on Source Code Modification](#conclusion-on-source-code-modification)
 6.  [Brainstorming New Extensions: List of Possible Capabilities](#brainstorming-new-extensions-list-of-possible-capabilities)
     *   [I. Adding Custom Tools & Actions](#i-adding-custom-tools--actions)
@@ -499,7 +500,7 @@ While the external command tool mechanism is powerful for many extensions, it ru
 
 **Conclusion on the External Tool for API Preview:**
 
-For simple "what-if" scenarios or basic prompt templating, an external tool might offer some value. However, for the goal of obtaining a **high-fidelity, accurate preview of the exact data payload the live CLI session would send to the LLM**, the external tool approach is generally insufficient and flawed due to its isolation from the CLI's internal runtime state.
+For simple "what-if" scenarios or basic prompt templating, an external tool might offer some value. However, for the goal of obtaining a **high-fidelity, accurate preview of the exact data payload the live CLI session would send to the LLM**, the external tool approach is generally insufficient due to its isolation from the CLI's internal runtime state.
 
 This leads to the understanding that certain advanced introspection or behavioral modification goals, like this precise API call preview, are better addressed by extending or modifying the CLI's core logic directly.
 
@@ -513,87 +514,76 @@ This path should generally be considered after exploring other avenues:
 
 1.  **Leverage Existing CLI Configurations:** Always check if the desired behavior or information can be achieved through existing settings in the CLI's configuration files. The CLI is designed to be quite flexible.
 2.  **Utilize Standard Extension Mechanisms:** For adding new capabilities (tools) or providing additional context, use the External Command tool system, MCP servers, or context files (`extensionContextFilePaths`, `GEMINI.md`) as described earlier in this guide. These methods are designed for extending functionality without altering core code.
-3.  **Consider Source Code Modification (for Advanced Needs):** If the above methods are insufficient—as in our API Call Preview example where precise internal state is needed—then direct modification of the CLI's source code is the next level of customization.
+3.  **Consider Source Code Modification (for Advanced Needs):** If the above methods are insufficient—as in our API Call Preview example where precise internal state is needed—then direct modification of the CLI's source code is the next level of customization. This typically involves cloning the `gemini-cli` repository and making changes to your local copy.
 
 #### User Goal Revisited: API Call Preview
 To see the full, accurate API request data (prompt, history, tools, etc.) that the CLI would send to the LLM, without actually sending it, for debugging purposes.
 
 #### Conceptual Implementation within Core Logic
 
-The most effective way to implement this is to add a conditional check within the CLI's code, right before the point where it makes the actual call to the LLM API (e.g., the `generateContent` method).
+The most effective way to implement this is to add a conditional check within the CLI's code, right before the point where it makes the actual call to the LLM API (e.g., in the `GeminiClient` class, before it calls the `ContentGenerator`).
 
-*   **Trigger:** This feature would be triggered by a new configuration flag (e.g., `debugOptions.previewApiCall: true` and perhaps `debugOptions.previewApiCallFormat: "json" | "summary"`).
-*   **Logic (Conceptual Snippet):**
+*   **Trigger:** This feature would be triggered by new configuration flags (e.g., `debugOptions.apiPreview.previewApiCallEnabled: true` and `debugOptions.apiPreview.previewApiCallFormat: "json" | "summary"`), as detailed in the example `phase_2_config_additions.diff` found in the `Extensions_Guide_files/` directory.
+*   **Logic (Conceptual Snippet within `GeminiClient`):**
     ```typescript
-    // Conceptual point in the CLI's code (e.g., within GeminiClient or similar)
-    async function makeApiCall(requestPayload: GenerateContentRequest) { // Assuming GenerateContentRequest type
-      const debugOptions = this.config.getDebugOptions(); // Hypothetical getter for new debug options
+    // In a method like GeminiClient.sendMessageStream, generateJson, or generateContent,
+    // before calling this.contentGenerator.generateContentStream() or .generateContent()
 
-      if (debugOptions?.isPreviewApiCallEnabled()) {
-        console.log("\n--- API Call Preview ---");
-        if (debugOptions.getPreviewApiCallFormat() === "json") {
-          console.log(JSON.stringify(requestPayload, null, 2));
-        } else {
-          // Implement printSummarizedRequest(requestPayload) for a human-readable summary
-          // This summary would extract key parts: system prompt, recent history, current prompt, tool names.
-          console.log("Model:", requestPayload.model);
-          // ... more summarized fields
-        }
+    if (this.config.isDebugApiPreviewEnabled()) { // Method from new config
+      const requestPayload = /* logic to assemble the full GenerateContentRequest */;
+      this.performApiPreview(requestPayload, "methodName"); // New helper method
 
-        // Option A: Halt execution for this turn (don't send to LLM)
-        // This would typically involve returning a special response that the CLI understands as "preview only"
-        return {
-          previewDisplayed: true,
-          candidates: [{ content: { parts: [{text: "[API Call Previewed - Not Sent]"}] } }]
-        };
-
-        // Option B: Prompt user if they want to proceed with sending (more complex for CLI flow)
-        // const proceed = await this.cliEnvironment.promptUser("Send this request to the LLM? (y/N)");
-        // if (!proceed) return { previewDisplayed: true, ... };
-      }
-
-      // Original logic: Send requestPayload to the LLM API
-      // return await this.actualLlmApiService.generateContent(requestPayload);
+      // Return a mock/preview response instead of calling the actual LLM
+      // For a stream:
+      // yield { type: GeminiEventType.Content, value: "[API Call Previewed - Not Sent]" }; return;
+      // For a promise-based method:
+      // return Promise.resolve({ __isPreview__: true, message: "[API Call Previewed - Not Sent]" });
     }
+
+    // Original logic: proceed to call this.contentGenerator...
     ```
+    The `performApiPreview` helper method would handle the actual printing in JSON or summary format.
 
 #### Development Steps (Guidance for a User/LLM Assistant)
 
-If a user (with development skills) decides this feature is essential, here's a general path an LLM could guide them through:
+If a user (with development skills) decides this feature is essential for their local `gemini-cli` clone (especially since upstream contribution for this might be on hold or denied):
 
-1.  **(Optional) Provisional Local Testing with Monkeypatching (Advanced & Risky):**
-    *   **Disclaimer:** This is for highly technical users for temporary, local experimentation only. It's not a robust solution, can easily break, and should not be used for shared or production-like environments.
-    *   **Concept:** If the CLI is a Node.js application and the relevant API call function is accessible, one *might* temporarily override (monkeypatch) that function in their local, modified runtime environment to inject the preview logic.
-    *   **Limitations:** Highly dependent on CLI's internal structure, module system, and susceptibility to such patching. It's a "quick hack" for exploration, not a proper solution.
+1.  **Understand the Codebase:** Familiarize yourself with the `gemini-cli` source, particularly:
+    *   `packages/core/src/config/config.ts` (for adding configuration options).
+    *   `packages/core/src/core/client.ts` (likely `GeminiClient`, where API calls are orchestrated before hitting the `ContentGenerator`).
+    *   The project's build process and testing framework (likely Jest/Vitest, based on `*.test.ts` files).
 
-2.  **Cloning the CLI Repository:**
-    *   The standard and recommended approach for making lasting changes.
-    *   Guide: `git clone <repository_url>` (The URL of the Gemini CLI project)
+2.  **Implement Configuration Changes:**
+    *   Apply the changes shown in the `Extensions_Guide_files/phase_2_config_additions.diff` file to your local `config.ts` file. This adds the necessary `debugOptions` for enabling the preview and setting its format.
 
-3.  **Identifying the Code Location for API Calls:**
-    *   Guide the user to search the codebase for where `generateContent` (or the specific LLM SDK call) is made. This might be in a file like `packages/core/src/core/client.ts` (class `GeminiClient`) or within the `Turn.ts` class logic that orchestrates the call. Look for methods that prepare and send requests to the GenAI SDK.
+3.  **Implement Core Logic Modifications:**
+    *   Apply the changes shown in the `Extensions_Guide_files/phase_2_client_modifications.diff` file to your local `client.ts` file. This introduces the preview checking logic before API calls.
 
-4.  **Implementing the Feature:**
-    *   Guide on adding the new configuration flags (e.g., `previewApiCallEnabled`, `previewApiCallFormat`) to `ConfigParameters` and `Config` (likely in `packages/core/src/config/config.ts`). This includes defining how these options are accessed (e.g., `this.config.getDebugPreviewApiCallEnabled()`).
-    *   Show how to add the conditional logic (as per the conceptual example above) in the identified API call location.
-    *   If a summarized format is desired, the `printSummarizedRequest` function would need to be implemented.
+4.  **(Optional but Instructive) Provisional Local Testing with Monkeypatching:**
+    *   **Purpose:** For quick, temporary validation of your understanding of which methods to target, *before* full recompilation or writing extensive tests.
+    *   **How:** Use the script `Extensions_Guide_files/phase_0_monkeypatch_api_preview.ts` as a conceptual guide. You would need to adjust its import paths to point to your CLI's *compiled JavaScript output* (e.g., in `packages/core/build/src/...`) and run it with `ts-node`.
+    *   **Note:** This is an advanced technique primarily for exploration and understanding method interception. It's not a substitute for proper implementation.
 
-5.  **Building and Testing Locally:**
-    *   Provide instructions or point to project documentation on how to build the CLI from source (e.g., `npm install && npm run build` in the root and potentially `packages/cli`).
-    *   Explain how to run the locally built version to test the new feature (e.g., by linking the `packages/cli/bin/gemini.js` or using `npm link`).
+5.  **Write/Integrate Tests (TDD Approach):**
+    *   Use `Extensions_Guide_files/phase_1_api_preview.test.ts` as a template.
+    *   Place it appropriately within the `gemini-cli` test structure (e.g., `packages/core/src/core/client.api_preview.test.ts`).
+    *   Adapt imports and mocks to match the actual project structure and testing utilities.
+    *   Run these tests. They should guide your `phase_2` implementation and pass once it's correct.
 
-6.  **Creating a Pull Request (If Contributing Back):**
-    *   If the user wants to contribute this feature to the main project:
-        *   Create a fork of the repository.
-        *   Create a new branch for the feature (e.g., `feat/api-preview-debug`).
-        *   Commit changes following project conventions (e.g., conventional commit messages: `feat(debug): add API call preview mode`).
-        *   Write unit tests for the new feature and configuration.
-        *   Update any relevant documentation (e.g., a new section in a `DEBUGGING.md` or user guide, and updating `AGENTS.md` if applicable).
-        *   Push the branch to their fork and open a Pull Request to the main repository, clearly describing the feature, its motivation, and how it works.
+6.  **Build and Test Locally:**
+    *   After applying the `phase_2` diffs (config and client modifications), rebuild the `gemini-cli` from your modified source (e.g., using `npm run build` or equivalent commands as per the project's documentation).
+    *   Run your locally built CLI, enabling the feature via your `gemini-cli` settings/config file (e.g., by adding `debugOptions: { apiPreview: { previewApiCallEnabled: true, previewApiCallFormat: "json" } }` to the JSON config).
+    *   Verify that prompts trigger the preview output in the console instead of an LLM response.
+
+7.  **Using Your Modified Version:**
+    *   You'll be using your locally modified and built version of `gemini-cli`. It's advisable to keep your changes in a separate branch in your local clone for easier management if you later pull updates from the main `gemini-cli` repository.
+
+**Code Examples for Local Implementation:**
+For detailed, actionable code snippets and diffs for each phase described above (monkeypatching, TDD tests, config changes, client modifications), refer to the files within the **`Extensions_Guide_files/`** directory accompanying this guide. The `Extensions_Guide_files/README.md` provides specific instructions on how to use and apply these examples to a local clone of the `gemini-cli` source code.
 
 #### Conclusion on Source Code Modification
 
-Modifying the CLI's source code is the most powerful way to add features that require deep integration or access to internal state. It offers the highest fidelity for features like the API Call Preview. However, it also requires development skills (TypeScript/Node.js for this project), familiarity with the codebase, and the effort of maintaining a custom version or contributing changes upstream.
+Modifying the CLI's source code is the most powerful way to add features that require deep integration or access to internal state. It offers the highest fidelity for features like the API Call Preview. However, it also requires development skills (TypeScript/Node.js for this project), familiarity with the codebase, and the effort of maintaining a custom version.
 
 This approach represents a higher level of customization, generally pursued when existing configuration and standard extension mechanisms cannot meet specific, advanced requirements.
 

@@ -1,0 +1,188 @@
+--- a/packages/core/src/core/client.ts
++++ b/packages/core/src/core/client.ts
+@@ -10,7 +10,7 @@
+   GenerateContentResponse,
+ } from '@google/genai';
+ import { getFolderStructure } from '../utils/getFolderStructure.js';
+-import {
++import { // Assuming ServerGeminiStreamEvent and GeminiEventType are correctly imported
+   Turn,
+   ServerGeminiStreamEvent,
+   GeminiEventType,
+@@ -28,6 +28,10 @@
+ } from './contentGenerator.js';
+ import { ProxyAgent, setGlobalDispatcher } from 'undici';
+ import { DEFAULT_GEMINI_FLASH_MODEL } from '../config/models.js';
++// --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++// For yielding a preview event (if modifying sendMessageStream directly)
++// import { ServerGeminiContentEvent } from './turn.js'; // Or a more specific preview event type
++// --- END ADDITIONS FOR API PREVIEW FEATURE ---
+ import { AuthType } from './contentGenerator.js';
+
+ function isThinkingSupported(model: string) {
+@@ -35,6 +39,10 @@
+   return false;
+ }
+
++// --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++// For static storage of last previewed request, primarily for testing/debugging the feature itself.
++let lastPreviewedRequestPayload: GenerateContentRequest | null = null;
++// --- END ADDITIONS FOR API PREVIEW FEATURE ---
+ export class GeminiClient {
+   private chat?: GeminiChat;
+   private contentGenerator?: ContentGenerator;
+@@ -157,6 +165,43 @@
+     const turn = new Turn(this.getChat());
+     const resultStream = turn.run(request, signal);
+     for await (const event of resultStream) {
++      // --- BEGIN MODIFICATIONS FOR API PREVIEW FEATURE (applied within Turn.run or here) ---
++      // This is a conceptual placement. The ideal place is *before* the actual
++      // call to `this.chat.sendMessageStream` within `Turn.run` or, if modifying
++      // GeminiChat, before `this.contentGenerator.generateContentStream`.
++      // If we patch GeminiClient.sendMessageStream, the preview logic would wrap this whole loop.
++      // For this diff, let's assume the preview logic is added *before* this method
++      // even calls `turn.run`, or at the very beginning of `Turn.run`.
++      //
++      // Let's refine this: The preview should happen *before* `turn.run`
++      // if `sendMessageStream` itself is the point of interception.
++      // The `Turn` itself calls `GeminiChat`, which calls `ContentGenerator`.
++      // So, `GeminiClient.sendMessageStream` is a good high-level place.
++
++      // The following change demonstrates adding the check *inside* sendMessageStream
++      // if it were directly making the API call, or just before it delegates.
++      // The actual `generateContentStream` call is deeper, within `GeminiChat`.
++      // For a clean interception of what `GeminiClient` *intends* to send via `Turn` and `GeminiChat`:
++      if (this.config.isDebugApiPreviewEnabled()) {
++        // This is a simplified reconstruction for `sendMessageStream` context.
++        // A full `GenerateContentRequest` would be assembled by `GeminiChat`.
++        const currentHistory = await this.getChat().getHistory(true);
++        const systemInstruction = await this.getChat().getSystemInstruction();
++        const tools = await this.getChat().getTools();
++        const conceptualPayload = {
++          model: this.config.getModel(),
++          contents: [...currentHistory, { role: 'user', parts: request as Part[] }],
++          systemInstruction: systemInstruction,
++          tools: tools,
++        } as GenerateContentRequest; // Cast for structure
++
++        this.performApiPreview(conceptualPayload, 'sendMessageStream');
++
++        // Yield a mock event and stop, as per the feature's design
++        yield { type: GeminiEventType.Content, value: "[API Call Previewed in sendMessageStream - Not Sent]" } as ServerGeminiStreamEvent;
++        return new Turn(this.getChat()); // Return a Turn object as expected by the original signature
++      }
++      // --- END MODIFICATIONS FOR API PREVIEW FEATURE ---
+       yield event;
+     }
+     if (!turn.pendingToolCalls.length && signal && !signal.aborted) {
+@@ -185,6 +230,20 @@
+     topP: 1,
+   };
+   private readonly MAX_TURNS = 100;
++
++  // --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++  private performApiPreview(requestPayload: GenerateContentRequest, methodName: string): void {
++    lastPreviewedRequestPayload = JSON.parse(JSON.stringify(requestPayload)); // Deep clone
++    const previewFormat = this.config.getDebugApiPreviewFormat();
++    console.log(`\n--- API Call Preview (from ${methodName} in GeminiClient) ---`);
++    if (previewFormat === 'json') {
++      console.log(JSON.stringify(requestPayload, null, 2));
++    } else { // summary
++      this.printSummarizedRequest(requestPayload);
++    }
++    console.log("--- End of API Call Preview ---\n");
++  }
++
++  private printSummarizedRequest(request: GenerateContentRequest): void {
++    console.log(`  Model: ${request.model || this.config.getModel()}`);
++    if (request.systemInstruction) {
++      const siText = request.systemInstruction.parts?.map(p => p.text || '[non-text part]').join('\\n') || "N/A";
++      console.log(`  System Instruction: ${siText.substring(0, 100)}${siText.length > 100 ? '...' : ''}`);
++    }
++    console.log(`  Contents (${request.contents?.length || 0} messages):`);
++    request.contents?.forEach((content, index) => {
++      const role = content.role || (index % 2 === 0 ? 'user' : 'model'); // Simplified
++      const partsSummary = content.parts?.map(p => {
++        if (p.text) return `Text(len:${p.text.length})`;
++        if ((p as any).inlineData) return `InlineData(${(p as any).inlineData.mimeType})`; // Adjust based on actual Part type
++        if ((p as any).functionCall) return `FunctionCall(${(p as any).functionCall.name})`;
++        if ((p as any).functionResponse) return `FunctionResponse(${(p as any).functionResponse.name})`;
++        return 'UnknownPart';
++      }).join(', ') || "No Parts";
++      console.log(`    [${index}] Role: ${role}, Parts: [${partsSummary}]`);
++    });
++    if (request.tools) {
++      console.log(`  Tools: ${request.tools.length} tool definition(s) provided.`);
++    }
++    if(request.toolConfig) {
++      console.log(`  Tool Config: ${JSON.stringify(request.toolConfig)}`);
++    }
++  }
++
++  public static getLastPreviewedRequest(): GenerateContentRequest | null {
++    return lastPreviewedRequestPayload;
++  }
++  // --- END ADDITIONS FOR API PREVIEW FEATURE ---
+
+   constructor(private config: Config) {
+     if (config.getProxy()) {
+@@ -296,6 +455,20 @@
+         authType: this.config.getContentGeneratorConfig()?.authType,
+       });
+
++      // --- BEGIN MODIFICATIONS FOR API PREVIEW FEATURE ---
++      if (this.config.isDebugApiPreviewEnabled()) {
++        const requestPayload: GenerateContentRequest = {
++          model: model,
++          contents,
++          generationConfig: requestConfig, // This is GenerateContentConfig, not the full request config
++          responseSchema: schema,
++          responseMimeType: 'application/json',
++          systemInstruction: systemInstruction
++        };
++        this.performApiPreview(requestPayload, 'generateJson');
++        return Promise.resolve({ __isPreview__: true, message: "[API Call Previewed - Not Sent]" });
++      }
++      // --- END MODIFICATIONS FOR API PREVIEW FEATURE ---
+       const text = getResponseText(result);
+       if (!text) {
+         const error = new Error(
+@@ -354,6 +527,18 @@
+         authType: this.config.getContentGeneratorConfig()?.authType,
+       });
+       return result;
++    } catch (error: unknown) {
++      // --- BEGIN MODIFICATIONS FOR API PREVIEW FEATURE ---
++      // Check if preview is enabled *before* error reporting for the actual call
++      if (this.config.isDebugApiPreviewEnabled()) {
++        const requestPayload: GenerateContentRequest = { model: modelToUse, contents, generationConfig: configToUse, systemInstruction: getCoreSystemPrompt(this.config.getUserMemory()) };
++        this.performApiPreview(requestPayload, 'generateContent');
++        // Return a mock response structure
++        return Promise.resolve({ __isPreview__: true, candidates: [{ content: {parts: [{text:"[API Call Previewed - Not Sent]"}]}}] } as any);
++      }
++      // --- END MODIFICATIONS FOR API PREVIEW FEATURE ---
++
++      // Original error handling continues if preview is not enabled
+       if (abortSignal.aborted) {
+         throw error;
+       }
+@@ -369,6 +554,19 @@
+         `Failed to generate content with model ${modelToUse}: ${getErrorMessage(error)}`,
+       );
+     }
++  }
++
++  // It's better to intercept at generateContent, generateJson, and sendMessageStream
++  // which are the public methods of GeminiClient that lead to API calls.
++  // The actual call to the GenAI SDK is within the ContentGenerator implementations.
++  // Modifying those (GoogleGenerativeAI or CodeAssistServer) would be another layer deeper
++  // and might be more complex if they are direct SDK usages.
++  // Intercepting in GeminiClient methods allows capturing the request as prepared by GeminiClient's logic.
++
++  async generateEmbedding(texts: string[]): Promise<number[][]> {
++    // NOTE: API Preview feature not typically applied to embeddings,
++    // as they are usually less for debugging typical LLM interaction flow.
++    // If needed, similar interception logic could be added here.
+     if (!texts || texts.length === 0) {
+       return [];
+     }

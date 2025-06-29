@@ -1,0 +1,114 @@
+--- a/packages/core/src/config/config.ts
++++ b/packages/core/src/config/config.ts
+@@ -25,6 +25,28 @@
+   DEFAULT_OTLP_ENDPOINT,
+   TelemetryTarget,
+   StartSessionEvent,
+-} from '../telemetry/index.js';
++} from '../telemetry/index.js'; // Assuming telemetry is already correctly imported
+ import {
+   DEFAULT_GEMINI_EMBEDDING_MODEL,
+   DEFAULT_GEMINI_FLASH_MODEL,
+ } from './models.js';
+ import { ClearcutLogger } from '../telemetry/clearcut-logger/clearcut-logger.js';
+
++
++// --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++
++/**
++ * Configuration options for the API call preview debugging feature.
++ */
++export interface DebugApiPreviewOptions {
++  /**
++   * If true, enables the API call preview mode.
++   * Instead of sending the request to the LLM, its payload will be displayed.
++   */
++  previewApiCallEnabled?: boolean;
++  /**
++   * Format for displaying the previewed API call.
++   * 'summary': A human-readable summary.
++   * 'json': The full request payload as pretty-printed JSON.
++   */
++  previewApiCallFormat?: 'summary' | 'json';
++}
++
++/**
++ * Interface for all debug-related options.
++ */
++export interface DebugOptions {
++  /** API Call Preview Options */
++  apiPreview?: DebugApiPreviewOptions;
++  // Other future debug flags can go here
++}
++
++// --- END ADDITIONS FOR API PREVIEW FEATURE ---
++
+ export enum ApprovalMode {
+   DEFAULT = 'default',
+   AUTO_EDIT = 'autoEdit',
+@@ -85,6 +107,10 @@
+   bugCommand?: BugCommandSettings;
+   model: string;
+   extensionContextFilePaths?: string[];
++
++  // --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++  debugOptions?: DebugOptions;
++  // --- END ADDITIONS FOR API PREVIEW FEATURE ---
+ }
+
+ export class Config {
+@@ -117,6 +143,11 @@
+   private readonly model: string;
+   private readonly extensionContextFilePaths: string[];
+   private modelSwitchedDuringSession: boolean = false;
++
++  // --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++  private readonly resolvedDebugOptions: Required<DebugOptions> & { apiPreview: Required<DebugApiPreviewOptions> };
++  // --- END ADDITIONS FOR API PREVIEW FEATURE ---
++
+   flashFallbackHandler?: FlashFallbackHandler;
+
+   constructor(params: ConfigParameters) {
+@@ -152,6 +183,15 @@
+     this.bugCommand = params.bugCommand;
+     this.model = params.model;
+     this.extensionContextFilePaths = params.extensionContextFilePaths ?? [];
++
++    // --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++    // Initialize debugOptions with defaults
++    this.resolvedDebugOptions = {
++      apiPreview: {
++        previewApiCallEnabled: params.debugOptions?.apiPreview?.previewApiCallEnabled ?? false,
++        previewApiCallFormat: params.debugOptions?.apiPreview?.previewApiCallFormat ?? 'summary',
++      },
++    };
++    // --- END ADDITIONS FOR API PREVIEW FEATURE ---
+
+     if (params.contextFileName) {
+       setGeminiMdFilename(params.contextFileName);
+@@ -334,6 +374,25 @@
+   getExtensionContextFilePaths(): string[] {
+     return this.extensionContextFilePaths;
+   }
++
++  // --- BEGIN ADDITIONS FOR API PREVIEW FEATURE ---
++
++  /**
++   * Gets the fully resolved debugging options, with defaults applied.
++   */
++  public getResolvedDebugOptions(): Required<DebugOptions> & { apiPreview: Required<DebugApiPreviewOptions> } {
++    return this.resolvedDebugOptions;
++  }
++
++  public isDebugApiPreviewEnabled(): boolean {
++    return this.resolvedDebugOptions.apiPreview.previewApiCallEnabled;
++  }
++
++  public getDebugApiPreviewFormat(): 'summary' | 'json' {
++    return this.resolvedDebugOptions.apiPreview.previewApiCallFormat;
++  }
++
++  // --- END ADDITIONS FOR API PREVIEW FEATURE ---
+
+   async getGitService(): Promise<GitService> {
+     if (!this.gitService) {

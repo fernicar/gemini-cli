@@ -19,6 +19,7 @@ There isn't a traditional "plugin" system where you drop a package into an exten
         *   [Considerations for External Command Tools](#considerations-for-external-command-tools)
     *   [Custom Tools via MCP Servers](#2-custom-tools-via-mcp-model-context-protocol-servers)
     *   [Choosing Between External Commands and MCP](#choosing-between-external-commands-and-mcp)
+    *   [Understanding Stateful vs. Stateless Tools](#understanding-stateful-vs-stateless-tools)
 3.  [Providing Additional Context to the LLM via Extensions](#providing-additional-context-to-the-llm-via-extensions)
     *   [Hierarchical Context Files](#1-hierarchical-context-files)
     *   [Explicit Context File Paths (`extensionContextFilePaths`)](#2-explicit-context-file-paths-extensioncontextfilepaths)
@@ -32,7 +33,8 @@ There isn't a traditional "plugin" system where you drop a package into an exten
     *   [Specialized Logging and Debugging](#5-specialized-logging-and-debugging-debugmode-telemetry-settings)
     *   [Checkpointing Strategy](#6-checkpointing-strategy-checkpointing)
     *   [Guiding File Discovery for Context](#7-guiding-file-discovery-for-context-filefiltering)
-5.  [Brainstorming New Extensions: List of Possible Capabilities](#brainstorming-new-extensions-list-of-possible-capabilities)
+5.  [Advanced Extension Example: Intercepting API Calls for Debugging](#advanced-extension-example-intercepting-api-calls-for-debugging)
+6.  [Brainstorming New Extensions: List of Possible Capabilities](#brainstorming-new-extensions-list-of-possible-capabilities)
     *   [I. Adding Custom Tools & Actions](#i-adding-custom-tools--actions)
     *   [II. Enhancing LLM Knowledge & Behavior](#ii-enhancing-llm-knowledge--behavior)
     *   [III. Customizing CLI Operations (via Configuration Guidance)](#iii-customizing-cli-operations-via-configuration-guidance)
@@ -194,7 +196,7 @@ This method involves creating two main components:
 *   **Permissions:** Scripts must be executable (`chmod +x`).
 *   **Error Handling:** Robust error handling and clear messages on `stderr` are vital for debugging and for the LLM to understand failures.
 *   **Security:** Be cautious if your tools execute arbitrary commands or modify the file system, especially based on LLM-generated parameters. Consider sandboxing or strict input validation. The CLI's built-in `ShellTool` already has sandboxing capabilities that custom tools would need to replicate if similar safety is desired.
-*   **State:** These tools are generally expected to be stateless, but they can read/write files if designed to do so.
+*   **State:** These tools are generally expected to be stateless, but they can read/write files if designed to do so. (See more on [Understanding Stateful vs. Stateless Tools](#understanding-stateful-vs-stateless-tools)).
 
 ### 2. Custom Tools via MCP (Model Context Protocol) Servers
 
@@ -224,16 +226,109 @@ This method is suitable if you have tools hosted as part of a separate service t
 
 ### Choosing Between External Commands and MCP
 
-*   **External Commands:**
-    *   Simpler for local scripts or integrating existing command-line utilities.
-    *   Good for tools tightly coupled with the local file system or environment.
-    *   No need to run a separate persistent server.
-*   **MCP Servers:**
-    *   Better for tools that are part of a larger service or require significant computational resources.
-    *   Allows tools to be hosted remotely and accessed by multiple clients.
-    *   Enforces a standard protocol for tool interaction.
+When deciding how to implement your custom tool, consider the following:
 
-By providing clear `FunctionDeclaration`s and robust execution logic (either as scripts or an MCP service), you can significantly enhance the capabilities available to the LLM through this CLI.
+*   **External Commands:**
+    *   **Pros:**
+        *   Simpler to set up for local scripts or integrating existing command-line utilities.
+        *   Good for tools tightly coupled with the local file system or environment.
+        *   No need to run or maintain a separate persistent server process.
+        *   Direct execution can be faster for simple tasks (no network overhead to an MCP server).
+    *   **Cons:**
+        *   Less suitable for tools that need to maintain complex state across many users or invocations (unless they manage their own persistent storage like files or a local database).
+        *   Discovery (`toolDiscoveryCommand`) and execution (`toolCallCommand`) rely on the user's environment having the necessary interpreters (e.g., Python, Node.js, bash) and dependencies correctly configured.
+        *   Sharing tools across a team might involve distributing scripts and ensuring consistent environments.
+
+*   **MCP Servers:**
+    *   **Pros:**
+        *   Better for tools that are part of a larger, more complex service or require significant computational resources that can be centralized.
+        *   Allows tools to be hosted remotely and accessed by multiple clients or users consistently.
+        *   Enforces a standard protocol for tool interaction, potentially making tools more interoperable.
+        *   Can maintain complex state or leverage resources (databases, caches) available on the server side.
+        *   Abstracts the execution environment from the client CLI.
+    *   **Cons:**
+        *   More complex to set up and maintain (requires running a persistent server application).
+        *   Introduces network latency for tool calls.
+        *   Can be overkill for simple, local-only tools.
+
+**Rule of Thumb: When is MCP Overkill? API Call Efficiency Matters.**
+
+While MCP offers a robust way to serve tools, it's not always the most efficient or necessary solution, especially when considering the effort of implementation and potential operational costs (like API calls made by the MCP server itself).
+
+*   **Consider MCP Overkill If:**
+    *   **Simple, Local Tasks:** The tool performs a straightforward task that can be easily achieved with a local script (e.g., reading a specific local config file, a simple text transformation, running a single local command).
+    *   **Infrequent Use / Project-Specific:** The tool is only relevant to a single user or a specific local project and doesn't need to be shared widely as a persistent service.
+    *   **One-Off Operations:** The primary use case involves a single execution or very infrequent use where the overhead of setting up and maintaining an MCP server isn't justified.
+    *   **No Shared State/Resources Needed:** The tool doesn't need to maintain state across different users/clients or access server-side resources that a local script couldn't.
+
+*   **Prioritize API Call Efficiency (Especially if your MCP server calls other LLMs/APIs):**
+    *   The core principle is to be mindful of resource consumption. If your MCP tool, in turn, makes calls to other paid APIs (like another LLM for a sub-task), each invocation of your MCP tool from the Gemini CLI could trigger those downstream costs.
+    *   **Scenario to Avoid:** Imagine an MCP tool that, for every call, makes multiple LLM API calls to achieve its result. If this tool is used frequently for tasks that could have been batched or handled by a more intelligent local script with fewer (or no) external API calls, it becomes inefficient and costly.
+    *   **Strive for Efficiency:**
+        *   **Local Scripts for Batchable Work:** If a task involves processing multiple items or steps that can be defined upfront, a local script (External Command tool) that does all the work in one go and then returns a single consolidated result is often far more efficient than an MCP tool called iteratively for each small step.
+        *   **Intelligent MCP Tools:** If an MCP tool *must* call other APIs, design it to be as efficient as possible. Can it batch requests? Can it cache results? Can it do some processing locally before deciding if an API call is truly necessary?
+    *   **The Test of Time:** A poorly designed or unnecessarily complex MCP implementation that is inefficient (e.g., high latency, high cost per call due to downstream APIs, difficult to maintain) is likely to be abandoned or "forgotten." The initial effort to build it will be wasted if it's not designed with practicality and efficiency in mind for its intended use case.
+
+**Recommendation:**
+
+Start with the simplest approach that meets the immediate need.
+*   For most local file operations, text processing, or wrapping existing CLI utilities, **External Command tools** are often sufficient, efficient, and easier to manage.
+*   Consider **MCP Servers** when you need to provide tools as a shared, persistent service, when tools require significant server-side resources/state, or when you're building a standardized tool ecosystem for a team or organization. Always weigh the added complexity and potential operational overhead against the benefits.
+
+### Understanding Stateful vs. Stateless Tools
+
+When designing or using tools, it's important to understand whether they are *stateless* or *stateful*, as this impacts how they behave and how you should reason about their effects.
+
+*   **Stateless Tools:**
+    *   These tools operate solely based on the input parameters they receive for a given call.
+    *   They do not remember any information from previous calls.
+    *   Given the same input parameters and the same external environment (e.g., file content they read), they will always produce the same output.
+    *   They generally do not have side effects that change the system's state (e.g., they don't write files or modify persistent settings).
+    *   **Examples of built-in tools that are primarily stateless:**
+        *   `list_directory (LSTool)`: Reads directory contents.
+        *   `read_file (ReadFileTool)`: Reads file content. (Note: Has a minor side effect of recording telemetry metrics).
+        *   `search_file_content (GrepTool)`: Searches file contents.
+        *   `glob (GlobTool)`: Finds files matching patterns.
+        *   `read_many_files (ReadManyFilesTool)`: Reads multiple files. (Note: Records telemetry metrics).
+        *   `google_web_search (WebSearchTool)`: Queries an external search engine; the tool itself doesn't store search history locally.
+        *   `web_fetch (WebFetchTool)`: Fetches web content; while it might interact with an LLM in its fallback, the tool itself doesn't store fetched data persistently.
+
+*   **Stateful Tools:**
+    *   These tools can remember information from previous calls or can change the state of the system in a way that affects future operations (by themselves or other tools).
+    *   Their behavior might depend on past interactions or existing configurations they modify.
+    *   They often have side effects, such as creating or modifying files, changing settings, or interacting with external services that maintain state.
+    *   **Examples of built-in tools that are stateful or modify external state:**
+        *   **`replace (EditTool)`**: Directly modifies file content on the filesystem. Each execution changes the file's state. It also maintains an internal (session-based) cache for edit corrections.
+        *   **`write_file (WriteFileTool)`**: Creates or overwrites files, directly changing filesystem state. It also records telemetry metrics.
+        *   **`run_shell_command (ShellTool)`**: Executes arbitrary shell commands. These can modify files, environment variables (for the subprocess), start persistent background processes, or interact with any external stateful service. It also maintains a session-based whitelist of approved commands and creates temporary files for process group info.
+        *   **`save_memory (MemoryTool)`**: Explicitly designed to be stateful. It appends information to a persistent memory file (e.g., `~/.gemini/GEMINI.md`), altering the LLM's long-term context for future sessions.
+
+**Considerations for Custom Tools:**
+
+When you create custom tools (either via External Commands or MCP Servers), you decide their statefulness:
+
+*   **Designing Stateless Custom Tools:**
+    *   Your tool's script or MCP endpoint receives a request, processes it based *only* on the current input and readily available external information (like reading a file *as it is now*), and returns a result.
+    *   It does not write to persistent storage in a way that influences its *own* future calls.
+    *   This is often simpler to reason about and test.
+
+*   **Designing Stateful Custom Tools:**
+    *   Your tool might:
+        *   Write to files that it or other tools will read later (e.g., a tool that manages a to-do list in a local file).
+        *   Store data in a database.
+        *   Maintain a configuration file that it modifies and reads.
+        *   Interact with an external API that remembers session information.
+    *   Stateful tools are more powerful for certain tasks but require careful design to manage state correctly and avoid unintended consequences.
+    *   Clearly document the stateful nature of your custom tool in its description so the LLM (and users) understand its behavior and potential side effects. For example, if a tool `append_to_log` adds a line to `my_app.log`, its description should state this.
+
+**LLM Awareness:**
+
+The LLM should be aware of the stateful nature of certain tools.
+*   For tools like `EditTool` or `WriteFileTool`, the LLM should understand that successive calls can build upon each other (e.g., writing a file, then editing it).
+*   For `MemoryTool`, the LLM should understand it's making a persistent change.
+*   When using `ShellTool`, the LLM should be guided to be cautious if commands could have lasting side effects, especially if the goal is a read-only operation.
+
+Understanding this distinction helps in predicting tool behavior, debugging issues, and designing more effective interactions with the CLI and its extensions.
 
 ## Providing Additional Context to the LLM via Extensions
 
@@ -362,6 +457,117 @@ While custom tools and custom context are the primary ways to extend the CLI's f
 *   **No Automatic Configuration:** The CLI does not have a mechanism for an "extension package" to automatically apply these settings.
 
 By thinking about these configuration points, an LLM designing an extension can provide a more holistic solution that not only adds tools and knowledge but also guides the user in setting up the CLI environment for optimal interaction with the extension.
+
+## Advanced Extension Example: Intercepting API Calls for Debugging
+
+One powerful use case for extensions is to create tools that help debug or understand the CLI's interactions with the Large Language Model (LLM). Imagine a scenario where a user wants to see the exact, fully assembled prompt, including all context and tool definitions, that is about to be sent to the LLM, *without actually sending it* and incurring API costs or waiting for a response. This can be invaluable for debugging why an LLM might be behaving unexpectedly or for learning how context is being constructed.
+
+This example outlines how such an "API Call Preview" extension could be built.
+
+**Goal of the Extension:**
+
+*   To provide a way for the user to type a prompt as they normally would.
+*   Instead of the CLI immediately sending this to the LLM, the extension intercepts this.
+*   The extension then displays the complete data package (prompt, history, tool schemas, etc.) that *would have been* sent to the LLM.
+*   This allows the user to inspect the context, verify tool definitions, and understand exactly what the LLM would receive.
+
+**Components of the Extension:**
+
+1.  **Custom Tool: `preview_llm_request`**
+    *   **Discovery Script:** The extension's `discover_tools.sh` (or equivalent) would define this tool.
+        ```json
+        // In discover_tools.sh output
+        [
+          {
+            "name": "preview_llm_request",
+            "description": "Captures your input and displays the full request data (prompt, history, tools) that would be sent to the LLM, without actually making the API call. Use this to debug context or understand the API request structure.",
+            "parameters": {
+              "type": "OBJECT",
+              "properties": {
+                "user_prompt": {
+                  "type": "STRING",
+                  "description": "The prompt or question you would normally ask the LLM."
+                }
+              },
+              "required": ["user_prompt"]
+            }
+          }
+        ]
+        ```
+    *   **Call Handler Script (`handle_tool_call.sh preview_llm_request`):** This is the core of the extension. It would need to:
+        *   Receive the `user_prompt` from its `stdin`.
+        *   **Access Core CLI Configuration and State (Conceptual):** This is the trickiest part and highlights where such an extension pushes the boundaries of simple external scripts. The script would ideally need access to:
+            *   The current chat history.
+            *   The fully resolved system prompt.
+            *   The list of all `FunctionDeclaration`s for all currently active tools (built-in and custom).
+            *   The current `Config` object to understand settings like `model`, `userMemory`, etc.
+        *   **Simulate Request Assembly:** The script would then try to replicate the logic that `GeminiClient` or `GeminiChat` uses to assemble the final request payload for the `generateContent` API call. This involves:
+            *   Formatting chat history.
+            *   Combining system prompt, user memory (from context files), and the current `user_prompt`.
+            *   Compiling the list of tool schemas.
+        *   **Output:** Instead of sending this payload to an LLM, the script would pretty-print the assembled JSON (or a summary of it) to `stdout`.
+
+2.  **Context File (Optional but Recommended):**
+    *   The extension could include a `preview_extension_guide.md` file.
+    *   This file would be added to `extensionContextFilePaths` in the user's CLI configuration.
+    *   **Content:** "When you want to debug the LLM request, use the `preview_llm_request` tool. Provide your intended prompt to its `user_prompt` parameter. This will show you the data before it goes to the API."
+
+**How the User Would Interact:**
+
+1.  **Configuration:**
+    *   User configures `toolDiscoveryCommand` and `toolCallCommand` to point to the extension's scripts.
+    *   User adds `my-preview-extension/preview_extension_guide.md` to `extensionContextFilePaths`.
+
+2.  **Usage:**
+    Instead of directly prompting the LLM like:
+    `$ gemini-cli "Why is the sky blue?"`
+
+    The user would invoke the custom tool:
+    `$ gemini-cli "/preview_llm_request user_prompt='Why is the sky blue?'"`
+
+    Or, if the CLI supports interactive tool calls:
+    `/preview_llm_request`
+    Then, when prompted for `user_prompt`: `Why is the sky blue?`
+
+3.  **Output:**
+    The CLI would output something like:
+    ```
+    API Request Preview:
+    --------------------
+    Model: gemini-pro
+    System Prompt: "You are a helpful assistant..."
+    User Memory (from GEMINI.md, etc.): "Context from file1..."
+    Chat History: [
+      {"role": "user", "parts": [{"text": "Hello"}]},
+      {"role": "model", "parts": [{"text": "Hi there!"}]}
+    ]
+    Current User Prompt: "Why is the sky blue?"
+    Tools Available: [
+      {"name": "read_file", "description": "..."},
+      {"name": "replace", "description": "..."}
+      // ... all other tools
+    ]
+    --------------------
+    (Note: This is a simplified representation. The actual output might be a more detailed JSON.)
+    ```
+
+**Challenges and Considerations:**
+
+*   **Accessing Internal State:** The main challenge for an *external script* is getting access to the CLI's internal state (chat history, resolved prompts, tool registry from `GeminiClient` or `Config`).
+    *   **Simplification:** A simpler version might only show the user's input and what it *thinks* the static parts of the prompt would be, without full history or dynamically loaded tools.
+    *   **Advanced (Hypothetical):** A more deeply integrated extension system (beyond current capabilities) might provide specific APIs for extensions to query this internal state safely.
+    *   **Workaround:** The `handle_tool_call.sh` script *could* try to re-initialize parts of the `Config` and `ToolRegistry` itself by reading the same configuration files the main CLI uses. This is complex and prone to discrepancies if the CLI's internal logic changes. It might also need to manage its own temporary chat history file if it wants to simulate multi-turn conversations for the preview.
+
+*   **Maintaining Fidelity:** Accurately replicating the exact request assembly logic of the core CLI can be difficult and brittle.
+
+**Why This Example is Instructive:**
+
+*   It shows how a custom tool can fundamentally alter the user's interaction flow for a specific purpose (debugging).
+*   It highlights the desire for introspection into the CLI's operations.
+*   It demonstrates a complex requirement that pushes the limits of a purely external command-based extension system, hinting at where more direct integration points or APIs for extensions could be beneficial in the future for such advanced scenarios.
+*   Even a simplified version that, for instance, just shows the `user_prompt` combined with `userMemory` (loaded by the script itself by mimicking `loadServerHierarchicalMemory`) and the list of tools from its own discovery could be useful.
+
+This "API Call Preview" extension, even with potential simplifications, serves as a powerful example of how users might want to extend the CLI for deeper understanding and control over LLM interactions.
 
 ## Brainstorming New Extensions: List of Possible Capabilities
 
